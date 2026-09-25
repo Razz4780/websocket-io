@@ -63,6 +63,8 @@ mod linux {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Impl {
         WebSocketIO,
+        /// With 128 KiB buffers and 256 KiB frames, like tokio-tungstenite's defaults.
+        WebSocketIOLarge,
         Tungstenite,
         FastWebSockets,
     }
@@ -71,8 +73,21 @@ mod linux {
         fn name(self) -> &'static str {
             match self {
                 Self::WebSocketIO => "websocket-io",
+                Self::WebSocketIOLarge => "websocket-io-128k",
                 Self::Tungstenite => "tokio-tungstenite",
                 Self::FastWebSockets => "fastwebsockets",
+            }
+        }
+    }
+
+    impl Impl {
+        fn config(self) -> Config {
+            match self {
+                Self::WebSocketIOLarge => Config::default()
+                    .read_buffer_size(128 * 1024)
+                    .write_buffer_size(128 * 1024)
+                    .max_frame_size(256 * 1024),
+                _ => Config::default(),
             }
         }
     }
@@ -210,8 +225,8 @@ mod linux {
         rt.block_on(async {
             let stream = tokio_stream(stream);
             match imp {
-                Impl::WebSocketIO => {
-                    let mut ws = WebSocketIO::new(stream, role, Config::default());
+                Impl::WebSocketIO | Impl::WebSocketIOLarge => {
+                    let mut ws = WebSocketIO::new(stream, role, imp.config());
                     measure!(shared, false, bytes, {
                         for chunk in chunks(&data, size, bytes) {
                             ws.write_all(&chunk).await.unwrap();
@@ -254,8 +269,8 @@ mod linux {
         rt.block_on(async {
             let stream = tokio_stream(stream);
             match imp {
-                Impl::WebSocketIO => {
-                    let mut ws = WebSocketIO::new(stream, role, Config::default());
+                Impl::WebSocketIO | Impl::WebSocketIOLarge => {
+                    let mut ws = WebSocketIO::new(stream, role, imp.config());
                     let mut buf = vec![0; 64 * 1024];
                     measure!(shared, true, bytes, {
                         let mut received = 0;
@@ -334,7 +349,12 @@ mod linux {
                 Role::Client => Role::Server,
                 Role::Server => Role::Client,
             };
-            let impls = [Impl::WebSocketIO, Impl::Tungstenite, Impl::FastWebSockets];
+            let impls = [
+                Impl::WebSocketIO,
+                Impl::WebSocketIOLarge,
+                Impl::Tungstenite,
+                Impl::FastWebSockets,
+            ];
 
             println!(
                 "\n{direction}: CPU µs per MiB moved (median of {RUNS} runs of ~{}s)",
