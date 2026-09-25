@@ -67,13 +67,6 @@ large write, nothing is accepted and the write returns `Pending`.
 AVX2 build of the same code is selected at runtime. Client masking keys come from the OS entropy
 source, 1024 keys per syscall. A peer's all-zero key skips the unmasking pass.
 
-`Config::zero_mask_key(true)` makes a client mask its frames with an all-zero key: the frames stay
-formally masked (servers accept them), but the payload goes out unchanged, so the client sends like
-a server. **This violates RFC 6455**, which requires unpredictable keys to protect intermediaries
-that do not understand WebSocket from payloads crafted to look like HTTP requests. Use it only when
-an attacker cannot choose the payload, or no such intermediary can see the plaintext (e.g. TLS
-terminated by the server).
-
 **Control frames.** Pings are answered, and the peer's Close frame is replied to, by the receiving
 methods themselves: the replies go out without waiting for the sending side to flush, so a separate
 writer task is not needed. Receiving never blocks on a stalled write. Unanswered pings are
@@ -89,34 +82,64 @@ Not supported: the HTTP upgrade itself, extensions (permessage-deflate), splitti
 
 ## Performance
 
-`cargo bench --bench throughput` moves 4 MiB one way over loopback TCP, in writes of the given
-size, with both ends in one task on a current-thread runtime (so it compares CPU efficiency).
-The websocket-io receiver reads through `AsyncRead` into a 64 KiB buffer. tokio-tungstenite gets
-zero-copy `Bytes` slices, its best case. Throughput in GB/s, median, on a 4-vCPU x86-64 VM:
+All numbers are medians from a 4-vCPU x86-64 VM.
 
-| Write size | websocket-io | websocket-io, zero key | tokio-tungstenite 0.30 | fastwebsockets 0.10 |
-|---:|---:|---:|---:|---:|
+**CPU time per MiB moved.** `cargo bench --bench cpu_time` (Linux only) moves data one way over
+loopback TCP. The sender and the receiver run on separate threads, pinned to separate CPUs, each
+with its own current-thread runtime, and measure their own thread's CPU time. The websocket-io
+receiver reads through `AsyncRead` into a 64 KiB buffer; tokio-tungstenite sends zero-copy `Bytes`
+slices, its best case. Microseconds of CPU per MiB, total (user + kernel), and user alone in
+parentheses; the average of two runs, each the median of five one-second transfers. Kernel time includes the socket copies; on loopback, part of the receiving network
+stack runs in the sender's context, the same way for every implementation.
+
+| Write size | | websocket-io | tokio-tungstenite 0.30 | fastwebsockets 0.10 |
+|---:|---|---:|---:|---:|
 | **Client → server (masked)** | | | | |
-| 64 B | 0.64 | **0.82** | 0.24 | 0.02 |
-| 1 KiB | 1.65 | **1.71** | 1.11 | 0.33 |
-| 16 KiB | 1.92 | 1.90 | 1.57 | **2.10** |
-| 256 KiB | 1.91 | **1.99** | 1.61 | 1.81 |
+| 64 B | sender | **1,669 (883)** | 1,869 (1,623) | 85,046 (8,128) |
+|  | receiver | **828 (582)** | 3,132 (2,752) | 52,983 (11,704) |
+| 1 KiB | sender | 901 (228) | **780 (260)** | 5,428 (786) |
+|  | receiver | **365 (94)** | 510 (301) | 3,315 (635) |
+| 16 KiB | sender | **435 (143)** | 816 (190) | 784 (200) |
+|  | receiver | **252 (57)** | 397 (165) | 513 (96) |
+| 256 KiB | sender | **656 (121)** | 729 (141) | 700 (153) |
+|  | receiver | **240 (45)** | 287 (105) | 256 (57) |
 | **Server → client (unmasked)** | | | | |
-| 64 B | **0.78** | | 0.24 | 0.02 |
-| 1 KiB | **1.90** | | 1.20 | 0.33 |
-| 16 KiB | 1.95 | | 1.69 | **2.36** |
-| 256 KiB | 1.94 | | 1.75 | **2.24** |
+| 64 B | sender | **1,349 (754)** | 1,624 (1,394) | 75,510 (7,956) |
+|  | receiver | **689 (460)** | 2,863 (2,554) | 47,596 (9,808) |
+| 1 KiB | sender | **424 (176)** | 831 (244) | 5,606 (545) |
+|  | receiver | **238 (86)** | 493 (279) | 3,472 (678) |
+| 16 KiB | sender | **392 (135)** | 789 (177) | 674 (32) |
+|  | receiver | **218 (56)** | 368 (140) | 449 (62) |
+| 256 KiB | sender | **523 (4)** | 711 (138) | 531 (6) |
+|  | receiver | 218 (37) | 257 (76) | **217 (25)** |
 
-Over TCP, the kernel copy dominates large writes, which hides most of the cost of masking.
-`cargo bench --bench cpu` isolates the WebSocket layer: in-memory IO that is always ready and copies
-every byte once (like a kernel would). GB/s, median:
+**Throughput, both ends on one thread.** `cargo bench --bench throughput` runs the same transfer
+with both ends in one task on a current-thread runtime, so the throughput reflects the combined
+CPU cost of both sides. GB/s:
 
-| Write size | Send: client | Send: client, zero key | Send: server | Receive: from client | Receive: from zero-key client | Receive: from server |
-|---:|---:|---:|---:|---:|---:|---:|
-| 64 B | 2.03 | 3.94 | 4.21 | 2.05 | 2.41 | 2.44 |
-| 1 KiB | 11.5 | 13.7 | 14.2 | 11.5 | 12.1 | 11.7 |
-| 16 KiB | 15.0 | 17.1 | 16.9 | 15.3 | 16.2 | 15.6 |
-| 256 KiB | 16.8 | 33.4 | 30.7 | 16.8 | 20.2 | 22.1 |
+| Write size | websocket-io | tokio-tungstenite 0.30 | fastwebsockets 0.10 |
+|---:|---:|---:|---:|
+| **Client → server (masked)** | | | |
+| 64 B | **0.64** | 0.24 | 0.02 |
+| 1 KiB | **1.65** | 1.11 | 0.33 |
+| 16 KiB | 1.92 | 1.57 | **2.10** |
+| 256 KiB | **1.91** | 1.61 | 1.81 |
+| **Server → client (unmasked)** | | | |
+| 64 B | **0.78** | 0.24 | 0.02 |
+| 1 KiB | **1.90** | 1.20 | 0.33 |
+| 16 KiB | 1.95 | 1.69 | **2.36** |
+| 256 KiB | 1.94 | 1.75 | **2.24** |
+
+**WebSocket layer alone.** `cargo bench --bench cpu` runs each side over in-memory IO that is
+always ready and copies every byte once (like a kernel would), on one thread that never blocks, so
+wall time is CPU time. Microseconds of CPU per MiB:
+
+| Write size | Send: client (masking) | Send: server | Receive: from client (unmasking) | Receive: from server |
+|---:|---:|---:|---:|---:|
+| 64 B | 516 | 249 | 512 | 430 |
+| 1 KiB | 91 | 74 | 92 | 90 |
+| 16 KiB | 70 | 62 | 68 | 67 |
+| 256 KiB | 62 | 34 | 63 | 47 |
 
 `cargo bench --bench mask` compares the masking kernels (in-place, GB/s):
 
