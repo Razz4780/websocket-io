@@ -24,8 +24,7 @@ async fn our_client_to_tungstenite_server() {
         let mut client = WebSocketIO::new(
             Chaos::new(ours, seed, 3000, seed % 2 == 0),
             Role::Client,
-            // tungstenite accepts frames masked with a zero key.
-            Config::default().zero_mask_key(seed % 4 < 2),
+            Config::default(),
         );
         let data = Rng::new(seed).bytes(500_000);
 

@@ -1,8 +1,9 @@
 //! CPU cost of the data paths, over in-memory IO that is always ready.
 //!
 //! The IO copies every byte once, like a kernel would, so the numbers include one unavoidable copy
-//! on top of what the WebSocket layer does. Compares a server (no masking), a client with random
-//! masking keys, and a client with [`Config::zero_mask_key`].
+//! on top of what the WebSocket layer does. Compares a server (no masking) with a client (random
+//! masking keys). Everything runs on one thread and never blocks, so wall time is CPU time: the
+//! reported time per iteration is the CPU cost of moving 4 MiB through one side.
 
 use std::{
     hint::black_box,
@@ -24,25 +25,22 @@ enum Mode {
     Server,
     /// Client: frames masked with random keys.
     Client,
-    /// Client: frames masked with an all-zero key.
-    ClientZeroKey,
 }
 
 impl Mode {
-    const ALL: [Self; 3] = [Self::Server, Self::Client, Self::ClientZeroKey];
+    const ALL: [Self; 2] = [Self::Server, Self::Client];
 
     fn name(self) -> &'static str {
         match self {
             Self::Server => "server",
             Self::Client => "client",
-            Self::ClientZeroKey => "client-zero-key",
         }
     }
 
     fn role(self) -> Role {
         match self {
             Self::Server => Role::Server,
-            Self::Client | Self::ClientZeroKey => Role::Client,
+            Self::Client => Role::Client,
         }
     }
 
@@ -51,10 +49,6 @@ impl Mode {
             Role::Server => Role::Client,
             Role::Client => Role::Server,
         }
-    }
-
-    fn config(self) -> Config {
-        Config::default().zero_mask_key(matches!(self, Self::ClientZeroKey))
     }
 }
 
@@ -211,7 +205,7 @@ fn encode(mode: Mode, data: &[u8], size: usize) -> Vec<u8> {
         }
     }
 
-    let mut ws = WebSocketIO::new(VecIo(Vec::new()), mode.role(), mode.config());
+    let mut ws = WebSocketIO::new(VecIo(Vec::new()), mode.role(), Config::default());
     write_all(&mut ws, data, size);
     ws.into_inner().0
 }
@@ -226,7 +220,7 @@ fn send(c: &mut Criterion) {
                 scratch: vec![0; 1024 * 1024],
                 vectored: true,
             };
-            let mut ws = WebSocketIO::new(io, mode.role(), mode.config());
+            let mut ws = WebSocketIO::new(io, mode.role(), Config::default());
             group.bench_function(BenchmarkId::new(mode.name(), size), |b| {
                 b.iter(|| write_all(&mut ws, black_box(&data), size))
             });

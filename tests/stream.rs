@@ -48,9 +48,7 @@ where
     let to_client = rng.bytes(to_client_len);
 
     let config = Config::default().defer_close_reply(true);
-    // Every third run the client uses zero masking keys.
-    let client_config = config.clone().zero_mask_key(seed % 3 == 2);
-    let client = WebSocketIO::new(client, Role::Client, client_config);
+    let client = WebSocketIO::new(client, Role::Client, config.clone());
     let server = WebSocketIO::new(server, Role::Server, config);
     let (client_read, client_write) = tokio::io::split(client);
     let (server_read, server_write) = tokio::io::split(server);

@@ -28,7 +28,6 @@ pub struct Config {
     pub(crate) auto_pong: bool,
     pub(crate) defer_close_reply: bool,
     pub(crate) accept_unmasked_frames: bool,
-    pub(crate) zero_mask_key: bool,
 }
 
 impl Default for Config {
@@ -41,7 +40,6 @@ impl Default for Config {
             auto_pong: true,
             defer_close_reply: false,
             accept_unmasked_frames: false,
-            zero_mask_key: false,
         }
     }
 }
@@ -115,24 +113,6 @@ impl Config {
     #[must_use]
     pub fn accept_unmasked_frames(mut self, enabled: bool) -> Self {
         self.accept_unmasked_frames = enabled;
-        self
-    }
-
-    /// Whether a client masks its frames with an all-zero key. Defaults to `false`.
-    ///
-    /// The frames stay formally masked (the MASK bit is set, as servers require), but XOR with a
-    /// zero key leaves the payload unchanged. This saves the masking pass, and lets large writes go
-    /// straight from the caller's buffer to the IO with a vectored write, like on a server.
-    ///
-    /// **This violates RFC 6455**, which requires unpredictable masking keys. Masking protects
-    /// intermediaries that do not understand WebSocket (e.g. caching proxies) from payloads crafted to
-    /// look like HTTP requests. Enable it only when the payload cannot be chosen by an attacker, or
-    /// when no such intermediary can see the plaintext, e.g. over TLS terminated by the server.
-    ///
-    /// Ignored by servers.
-    #[must_use]
-    pub fn zero_mask_key(mut self, enabled: bool) -> Self {
-        self.zero_mask_key = enabled;
         self
     }
 }

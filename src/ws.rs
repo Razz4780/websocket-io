@@ -12,9 +12,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::{
     close::{CloseCode, CloseFrame},
     config::{Config, Role},
-    mask::MaskKeys,
     recv::{BytesDest, Recv, RecvState},
-    send::{Masking, SendState},
+    send::SendState,
 };
 
 /// A WebSocket connection working as a byte duplex.
@@ -69,12 +68,7 @@ impl<IO> WebSocketIO<IO> {
     /// Like [`WebSocketIO::new`], for when the HTTP layer has read past the end of the upgrade
     /// response. `read_buf` holds those bytes, it is used as the initial read buffer.
     pub fn with_read_buf(io: IO, role: Role, config: Config, read_buf: BytesMut) -> Self {
-        let masking = match role {
-            Role::Server => Masking::None,
-            Role::Client if config.zero_mask_key => Masking::Zero,
-            Role::Client => Masking::Random(Box::new(MaskKeys::new())),
-        };
-        let send = SendState::new(masking, config.write_buffer_size);
+        let send = SendState::new(role == Role::Client, config.write_buffer_size);
         Self {
             io,
             role,

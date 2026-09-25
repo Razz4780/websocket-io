@@ -11,7 +11,8 @@
 //! sender, the same way for every implementation.
 //!
 //! Run with `cargo bench --bench cpu_time [-- FILTER]`, where FILTER is matched against
-//! `direction/implementation/size`. Linux only.
+//! `direction/implementation/size`. "masked" sends from the client, "unmasked" from the server.
+//! Linux only.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -62,7 +63,6 @@ mod linux {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Impl {
         WebSocketIO,
-        WebSocketIOZeroKey,
         Tungstenite,
         FastWebSockets,
     }
@@ -71,7 +71,6 @@ mod linux {
         fn name(self) -> &'static str {
             match self {
                 Self::WebSocketIO => "websocket-io",
-                Self::WebSocketIOZeroKey => "websocket-io-zero-key",
                 Self::Tungstenite => "tokio-tungstenite",
                 Self::FastWebSockets => "fastwebsockets",
             }
@@ -211,9 +210,8 @@ mod linux {
         rt.block_on(async {
             let stream = tokio_stream(stream);
             match imp {
-                Impl::WebSocketIO | Impl::WebSocketIOZeroKey => {
-                    let config = Config::default().zero_mask_key(imp == Impl::WebSocketIOZeroKey);
-                    let mut ws = WebSocketIO::new(stream, role, config);
+                Impl::WebSocketIO => {
+                    let mut ws = WebSocketIO::new(stream, role, Config::default());
                     measure!(shared, false, bytes, {
                         for chunk in chunks(&data, size, bytes) {
                             ws.write_all(&chunk).await.unwrap();
@@ -256,7 +254,7 @@ mod linux {
         rt.block_on(async {
             let stream = tokio_stream(stream);
             match imp {
-                Impl::WebSocketIO | Impl::WebSocketIOZeroKey => {
+                Impl::WebSocketIO => {
                     let mut ws = WebSocketIO::new(stream, role, Config::default());
                     let mut buf = vec![0; 64 * 1024];
                     measure!(shared, true, bytes, {
@@ -336,16 +334,7 @@ mod linux {
                 Role::Client => Role::Server,
                 Role::Server => Role::Client,
             };
-            let impls: &[Impl] = if sender_role == Role::Client {
-                &[
-                    Impl::WebSocketIO,
-                    Impl::WebSocketIOZeroKey,
-                    Impl::Tungstenite,
-                    Impl::FastWebSockets,
-                ]
-            } else {
-                &[Impl::WebSocketIO, Impl::Tungstenite, Impl::FastWebSockets]
-            };
+            let impls = [Impl::WebSocketIO, Impl::Tungstenite, Impl::FastWebSockets];
 
             println!(
                 "\n{direction}: CPU µs per MiB moved (median of {RUNS} runs of ~{}s)",
@@ -362,7 +351,7 @@ mod linux {
                 "wall MB/s"
             );
             for size in SIZES {
-                for &imp in impls {
+                for imp in impls {
                     let id = format!("{direction}/{}/{size}", imp.name());
                     if !id.contains(&filter) {
                         continue;
