@@ -21,14 +21,32 @@ use crate::{
     ws::WebSocketIO,
 };
 
-/// Unmasked writes at least this large skip the write buffer and go to the IO with `writev`.
-const WRITE_THROUGH_MIN: usize = 16 * 1024;
+/// How outgoing frames are masked.
+pub(crate) enum Masking {
+    /// Server: frames are not masked.
+    None,
+    /// Client with [`Config::zero_mask_key`](crate::Config::zero_mask_key): frames are masked with
+    /// an all-zero key, which leaves the payload unchanged.
+    Zero,
+    /// Client: frames are masked with random keys.
+    Random(Box<MaskKeys>),
+}
+
+impl Masking {
+    #[inline]
+    fn next_key(&mut self) -> Option<[u8; 4]> {
+        match self {
+            Self::None => None,
+            Self::Zero => Some([0; 4]),
+            Self::Random(keys) => Some(keys.next()),
+        }
+    }
+}
 
 pub(crate) struct SendState {
     /// Encoded frames waiting for the IO. Only the first one may be partially written.
     pub(crate) buf: BytesMut,
-    /// Key source, present only for clients.
-    keys: Option<MaskKeys>,
+    masking: Masking,
     /// Payload of the latest unanswered ping. Newer pings replace older ones, as allowed by RFC
     /// 6455, which bounds the memory a ping flood can take.
     pub(crate) pending_pong: Option<Bytes>,
@@ -40,10 +58,10 @@ pub(crate) struct SendState {
 }
 
 impl SendState {
-    pub(crate) fn new(masked: bool, write_buffer_size: usize) -> Self {
+    pub(crate) fn new(masking: Masking, write_buffer_size: usize) -> Self {
         Self {
             buf: BytesMut::new(),
-            keys: masked.then(MaskKeys::new),
+            masking,
             pending_pong: None,
             close_sent: false,
             control_pending: false,
@@ -54,7 +72,7 @@ impl SendState {
     /// Appends a complete, single-frame message to the buffer. Masks the payload while copying it
     /// in if this is a client.
     pub(crate) fn push_frame(&mut self, opcode: OpCode, payload: &[u8]) {
-        let mask = self.keys.as_mut().map(MaskKeys::next);
+        let mask = self.masking.next_key();
         let mut header = [0; MAX_HEADER_LEN];
         let header_len = frame::encode(
             &mut header,
@@ -69,12 +87,12 @@ impl SendState {
         self.buf.reserve(header_len + payload.len());
         self.buf.extend_from_slice(&header[..header_len]);
         match mask {
-            Some(key) => {
+            Some(key) if key != [0; 4] => {
                 mask::copy_masked(self.buf.spare_capacity_mut(), payload, key, 0);
                 // SAFETY: `copy_masked` initialized `payload.len()` bytes of spare capacity.
                 unsafe { self.buf.set_len(self.buf.len() + payload.len()) };
             }
-            None => self.buf.extend_from_slice(payload),
+            _ => self.buf.extend_from_slice(payload),
         }
     }
 
@@ -117,9 +135,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
     /// [`Config::max_frame_size`](crate::Config::max_frame_size)), and small writes are buffered
     /// until [`poll_flush`](Self::poll_flush) or until the buffer fills up.
     ///
-    /// Clients mask the payload while copying it into the write buffer. Servers send writes of
-    /// 16 KiB and more straight from `data` with a vectored write, and copy only the part the IO
-    /// did not accept.
+    /// Clients mask the payload while copying it into the write buffer. Servers (and clients with
+    /// [`Config::zero_mask_key`](crate::Config::zero_mask_key)) send writes of at least half the
+    /// [write buffer size](crate::Config::write_buffer_size) straight from `data` with a vectored
+    /// write, and copy only the part the IO did not accept. Smaller writes are copied into the
+    /// write buffer, where they coalesce into fewer, larger writes to the IO.
     ///
     /// Fails with [`io::ErrorKind::BrokenPipe`] once our Close frame has been queued.
     pub fn poll_write(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
@@ -131,8 +151,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         }
         let data = &data[..data.len().min(self.config.max_frame_size)];
 
-        if self.send.keys.is_none()
-            && data.len() >= WRITE_THROUGH_MIN
+        if !matches!(self.send.masking, Masking::Random(_))
+            && data.len() >= self.config.write_buffer_size / 2
             && self.io.is_write_vectored()
         {
             return self.poll_write_through(cx, data);
@@ -145,7 +165,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         Poll::Ready(Ok(data.len()))
     }
 
-    /// Writes buffered frames and a new unmasked frame with `data` in one vectored write.
+    /// Writes buffered frames and a new frame with `data` in one vectored write. The frame must not
+    /// need an XOR pass: it is either unmasked, or masked with an all-zero key.
     ///
     /// Once any byte of the new frame reaches the IO, the frame is committed: the remainder is
     /// copied into the write buffer and the whole `data` is reported as written. If the IO does not
@@ -157,7 +178,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
             Header {
                 fin: true,
                 opcode: OpCode::Binary,
-                mask: None,
+                mask: self.send.masking.next_key(),
                 len: data.len() as u64,
             },
         );

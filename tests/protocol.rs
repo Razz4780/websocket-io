@@ -336,3 +336,50 @@ async fn leftover_bytes_from_upgrade() {
     ws.read_to_end(&mut data).await.unwrap();
     assert_eq!(data, b"early bird");
 }
+
+#[tokio::test]
+async fn zero_mask_key() {
+    let (ours, mut raw) = tokio::io::duplex(1024 * 1024);
+    // Vectored, so that large writes take the write-through path.
+    let mut ws = WebSocketIO::new(
+        Chaos::new(ours, 3, 50_000, true),
+        Role::Client,
+        Config::default().zero_mask_key(true),
+    );
+    let large = (0..100_000).map(|i| i as u8).collect::<Vec<_>>();
+
+    ws.write_all(b"small").await.unwrap();
+    ws.write_all(&large).await.unwrap();
+    ws.send_text("text").await.unwrap();
+    ws.send_ping(b"ping").await.unwrap();
+    ws.close(None).await.unwrap();
+    drop(ws);
+
+    let mut written = Vec::new();
+    raw.read_to_end(&mut written).await.unwrap();
+    // Every frame is masked, with an all-zero key, so the payload is sent as is.
+    let mut rest = &written[..];
+    while !rest.is_empty() {
+        assert_ne!(rest[1] & 0x80, 0, "frame is not masked");
+        let (len, key_at) = match rest[1] & 0x7F {
+            126 => (usize::from(u16::from_be_bytes([rest[2], rest[3]])), 4),
+            127 => (
+                u64::from_be_bytes(rest[2..10].try_into().unwrap()) as usize,
+                10,
+            ),
+            len => (usize::from(len), 2),
+        };
+        assert_eq!(rest[key_at..key_at + 4], [0; 4]);
+        rest = &rest[key_at + 4 + len..];
+    }
+    assert_eq!(
+        parse_raw_frames(&written),
+        [
+            (true, BINARY, b"small".to_vec()),
+            (true, BINARY, large),
+            (true, TEXT, b"text".to_vec()),
+            (true, PING, b"ping".to_vec()),
+            (true, CLOSE, Vec::new()),
+        ]
+    );
+}

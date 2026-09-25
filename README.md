@@ -54,8 +54,9 @@ to be complete to be useful, are the only ones collected, with size limits.
 
 **Sending.** Every write becomes one complete binary message (one frame of at most
 `max_frame_size` bytes). A client masks the payload while copying it into the write buffer, in one
-pass. A server writes large payloads straight from the caller's buffer, header and payload in one
-vectored write. Small writes are buffered until flushed, like with tokio's `BufWriter`.
+pass. A server writes large payloads (at least half the write buffer) straight from the caller's
+buffer, header and payload in one vectored write. Smaller writes are buffered until flushed, like
+with tokio's `BufWriter`, and coalesce into fewer, larger writes to the IO.
 
 A frame never waits for more data: when a write returns `Ready(n)`, the frame for those `n` bytes is
 complete, its head already in the IO and its tail (if the IO did not take everything) copied into
@@ -64,7 +65,14 @@ large write, nothing is accepted and the write returns `Pending`.
 
 **Masking.** The kernels XOR 8-byte lanes in 64-byte blocks, which LLVM vectorizes. On x86-64 an
 AVX2 build of the same code is selected at runtime. Client masking keys come from the OS entropy
-source, 64 keys per syscall.
+source, 1024 keys per syscall. A peer's all-zero key skips the unmasking pass.
+
+`Config::zero_mask_key(true)` makes a client mask its frames with an all-zero key: the frames stay
+formally masked (servers accept them), but the payload goes out unchanged, so the client sends like
+a server. **This violates RFC 6455**, which requires unpredictable keys to protect intermediaries
+that do not understand WebSocket from payloads crafted to look like HTTP requests. Use it only when
+an attacker cannot choose the payload, or no such intermediary can see the plaintext (e.g. TLS
+terminated by the server).
 
 **Control frames.** Pings are answered, and the peer's Close frame is replied to, by the receiving
 methods themselves: the replies go out without waiting for the sending side to flush, so a separate
@@ -86,18 +94,29 @@ size, with both ends in one task on a current-thread runtime (so it compares CPU
 The websocket-io receiver reads through `AsyncRead` into a 64 KiB buffer. tokio-tungstenite gets
 zero-copy `Bytes` slices, its best case. Throughput in GB/s, median, on a 4-vCPU x86-64 VM:
 
-| Write size | websocket-io | tokio-tungstenite 0.30 | fastwebsockets 0.10 |
-|---:|---:|---:|---:|
-| **Client → server (masked)** | | | |
-| 64 B | **0.56** | 0.22 | 0.02 |
-| 1 KiB | **1.53** | 1.04 | 0.31 |
-| 16 KiB | **1.86** | 1.43 | 1.88 |
-| 256 KiB | **1.88** | 1.49 | 1.81 |
-| **Server → client (unmasked)** | | | |
-| 64 B | **0.84** | 0.24 | 0.02 |
-| 1 KiB | **1.86** | 1.07 | 0.33 |
-| 16 KiB | 1.84 | 1.50 | **2.33** |
-| 256 KiB | **1.91** | 1.69 | 1.73 |
+| Write size | websocket-io | websocket-io, zero key | tokio-tungstenite 0.30 | fastwebsockets 0.10 |
+|---:|---:|---:|---:|---:|
+| **Client → server (masked)** | | | | |
+| 64 B | 0.64 | **0.82** | 0.24 | 0.02 |
+| 1 KiB | 1.65 | **1.71** | 1.11 | 0.33 |
+| 16 KiB | 1.92 | 1.90 | 1.57 | **2.10** |
+| 256 KiB | 1.91 | **1.99** | 1.61 | 1.81 |
+| **Server → client (unmasked)** | | | | |
+| 64 B | **0.78** | | 0.24 | 0.02 |
+| 1 KiB | **1.90** | | 1.20 | 0.33 |
+| 16 KiB | 1.95 | | 1.69 | **2.36** |
+| 256 KiB | 1.94 | | 1.75 | **2.24** |
+
+Over TCP, the kernel copy dominates large writes, which hides most of the cost of masking.
+`cargo bench --bench cpu` isolates the WebSocket layer: in-memory IO that is always ready and copies
+every byte once (like a kernel would). GB/s, median:
+
+| Write size | Send: client | Send: client, zero key | Send: server | Receive: from client | Receive: from zero-key client | Receive: from server |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 B | 2.03 | 3.94 | 4.21 | 2.05 | 2.41 | 2.44 |
+| 1 KiB | 11.5 | 13.7 | 14.2 | 11.5 | 12.1 | 11.7 |
+| 16 KiB | 15.0 | 17.1 | 16.9 | 15.3 | 16.2 | 15.6 |
+| 256 KiB | 16.8 | 33.4 | 30.7 | 16.8 | 20.2 | 22.1 |
 
 `cargo bench --bench mask` compares the masking kernels (in-place, GB/s):
 

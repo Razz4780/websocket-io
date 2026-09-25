@@ -30,3 +30,7 @@ harness = false
 [[bench]]
 name = "throughput"
 harness = false
+
+[[bench]]
+name = "cpu"
+harness = false

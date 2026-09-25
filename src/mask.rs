@@ -154,17 +154,17 @@ pub mod variants {
 
 /// Source of client masking keys.
 ///
-/// Keys are drawn from the OS entropy source in batches, one syscall serves 64 frames.
+/// Keys are drawn from the OS entropy source in batches, one syscall serves 1024 frames.
 pub(crate) struct MaskKeys {
-    buf: [u8; 256],
+    buf: [u8; 4096],
     pos: usize,
 }
 
 impl MaskKeys {
     pub(crate) fn new() -> Self {
         Self {
-            buf: [0; 256],
-            pos: 256,
+            buf: [0; 4096],
+            pos: 4096,
         }
     }
 

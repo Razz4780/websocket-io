@@ -1,6 +1,7 @@
 //! Moves data one way over a loopback TCP connection, in messages (writes) of a given size.
 //!
-//! "masked" sends from the client (the payload has to be masked), "unmasked" from the server.
+//! "masked" sends from the client (the payload has to be masked, or is "masked" with a zero key
+//! for websocket-io-zero-key), "unmasked" from the server.
 //! Both ends run in one task on a current-thread runtime, so the numbers compare CPU efficiency.
 
 use std::time::{Duration, Instant};
@@ -58,10 +59,17 @@ fn fast_role(role: Role) -> fastwebsockets::Role {
     }
 }
 
-async fn run_websocket_io(masked: bool, size: usize, data: &Bytes, iters: u64) -> Duration {
+async fn run_websocket_io(
+    masked: bool,
+    zero_key: bool,
+    size: usize,
+    data: &Bytes,
+    iters: u64,
+) -> Duration {
     let (a, b) = tcp_pair().await;
     let (send_role, recv_role) = roles(masked);
-    let mut sender = WebSocketIO::new(a, send_role, Config::default());
+    let config = Config::default().zero_mask_key(zero_key);
+    let mut sender = WebSocketIO::new(a, send_role, config);
     let mut receiver = WebSocketIO::new(b, recv_role, Config::default());
     let mut buf = vec![0; 64 * 1024];
 
@@ -153,8 +161,14 @@ fn throughput(c: &mut Criterion) {
         for size in SIZES {
             group.bench_function(BenchmarkId::new("websocket-io", size), |b| {
                 b.to_async(&rt)
-                    .iter_custom(|iters| run_websocket_io(masked, size, &data, iters))
+                    .iter_custom(|iters| run_websocket_io(masked, false, size, &data, iters))
             });
+            if masked {
+                group.bench_function(BenchmarkId::new("websocket-io-zero-key", size), |b| {
+                    b.to_async(&rt)
+                        .iter_custom(|iters| run_websocket_io(masked, true, size, &data, iters))
+                });
+            }
             group.bench_function(BenchmarkId::new("tokio-tungstenite", size), |b| {
                 b.to_async(&rt)
                     .iter_custom(|iters| run_tungstenite(masked, size, &data, iters))
