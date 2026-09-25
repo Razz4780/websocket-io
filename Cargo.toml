@@ -23,6 +23,9 @@ proptest = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.30"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 [[bench]]
 name = "mask"
 harness = false
@@ -33,4 +36,8 @@ harness = false
 
 [[bench]]
 name = "cpu"
+harness = false
+
+[[bench]]
+name = "cpu_time"
 harness = false
