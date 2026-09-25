@@ -1,0 +1,24 @@
+[package]
+name = "websocket-io"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "A Tokio-based WebSocket connection exposed as a fast byte duplex with poll-based access to control frames"
+repository = "https://github.com/Razz4780/websocket-io"
+readme = "README.md"
+keywords = ["websocket", "tokio", "async", "io"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+bytes = "1.10"
+getrandom = "0.4"
+tokio = { version = "1.40", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
+fastwebsockets = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+proptest = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"
