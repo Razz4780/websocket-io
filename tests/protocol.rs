@@ -2,10 +2,10 @@
 
 mod common;
 
-use std::io;
+use std::io::{self, IoSlice};
 
 use bytes::Bytes;
-use common::{Chaos, parse_raw_frames, raw_frame};
+use common::{Chaos, Rng, parse_raw_frames, random_slices, raw_frame, write_all_vectored};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use websocket_io::{CloseCode, CloseFrame, Config, ProtocolError, Recv, Role, WebSocketIO};
 
@@ -335,4 +335,69 @@ async fn leftover_bytes_from_upgrade() {
     let mut data = Vec::new();
     ws.read_to_end(&mut data).await.unwrap();
     assert_eq!(data, b"early bird");
+}
+
+#[tokio::test]
+async fn vectored_writes() {
+    let data = (0..300_000)
+        .map(|i| (i * 7 + i / 256) as u8)
+        .collect::<Vec<_>>();
+    for role in [Role::Server, Role::Client] {
+        for seed in 0..4 {
+            let (ours, mut raw) = tokio::io::duplex(4 * 1024 * 1024);
+            // Vectored IO taking random prefixes, so servers write straight from the slices and
+            // have to copy the rest of partially written frames.
+            let mut ws = WebSocketIO::new(
+                Chaos::new(ours, seed, 30_000, true),
+                role,
+                Config::default().max_frame_size(10_000),
+            );
+            let mut rng = Rng::new(seed);
+            let mut rest = &data[..];
+            while !rest.is_empty() {
+                let piece = (1 + rng.below(100_000)).min(rest.len());
+                let mut slices = random_slices(&mut rng, &rest[..piece], 64);
+                write_all_vectored(&mut ws, &mut slices).await.unwrap();
+                rest = &rest[piece..];
+            }
+            ws.close(None).await.unwrap();
+            drop(ws);
+
+            let mut written = Vec::new();
+            raw.read_to_end(&mut written).await.unwrap();
+            let mut frames = parse_raw_frames(&written);
+            assert_eq!(frames.pop(), Some((true, CLOSE, Vec::new())));
+            assert!(frames.iter().all(|(fin, opcode, payload)| *fin
+                && *opcode == BINARY
+                && payload.len() <= 10_000));
+            let payload = frames
+                .into_iter()
+                .flat_map(|(_, _, payload)| payload)
+                .collect::<Vec<_>>();
+            assert!(payload == data, "{role:?}, seed {seed}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn fragmented_vectored_write() {
+    // Far more slices than one vectored write of the IO can take: gathered into one frame.
+    let data = (0..5000).map(|i| i as u8).collect::<Vec<_>>();
+    let mut slices = data.chunks(1).map(IoSlice::new).collect::<Vec<_>>();
+    let (ours, mut raw) = tokio::io::duplex(1024 * 1024);
+    let mut ws = WebSocketIO::new(
+        Chaos::new(ours, 1, 100_000, true),
+        Role::Server,
+        Config::default(),
+    );
+    write_all_vectored(&mut ws, &mut slices).await.unwrap();
+    ws.close(None).await.unwrap();
+    drop(ws);
+
+    let mut written = Vec::new();
+    raw.read_to_end(&mut written).await.unwrap();
+    assert_eq!(
+        parse_raw_frames(&written),
+        [(true, BINARY, data), (true, CLOSE, Vec::new())]
+    );
 }

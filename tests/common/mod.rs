@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 /// xorshift64*, good enough for test data and chaos decisions.
 #[derive(Clone)]
@@ -194,4 +194,35 @@ pub fn parse_raw_frames(mut data: &[u8]) -> Vec<(bool, u8, Vec<u8>)> {
         data = &data[pos + len..];
     }
     frames
+}
+
+/// Writes all of `slices` with vectored writes.
+pub async fn write_all_vectored<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut slices: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    while slices.iter().any(|slice| !slice.is_empty()) {
+        let written = writer.write_vectored(slices).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut slices, written);
+    }
+    Ok(())
+}
+
+/// Splits `data` into up to `max_slices` slices of random lengths, some of them empty.
+pub fn random_slices<'a>(rng: &mut Rng, mut data: &'a [u8], max_slices: usize) -> Vec<IoSlice<'a>> {
+    let mut slices = Vec::new();
+    for _ in 1..1 + rng.below(max_slices) {
+        let len = if rng.below(5) == 0 {
+            0
+        } else {
+            rng.below(data.len() + 1)
+        };
+        slices.push(IoSlice::new(&data[..len]));
+        data = &data[len..];
+    }
+    slices.push(IoSlice::new(data));
+    slices
 }

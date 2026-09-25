@@ -4,14 +4,15 @@ mod common;
 
 use std::{io, time::Duration};
 
-use common::{Chaos, Rng};
+use common::{Chaos, Rng, random_slices, write_all_vectored};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use websocket_io::{CloseCode, CloseFrame, Config, Recv, Role, WebSocketIO};
 
-/// Writes `data` in random pieces with occasional flushes, then shuts down.
+/// Writes `data` in random pieces with occasional flushes, then shuts down. Every other seed
+/// writes each piece as random slices with vectored writes.
 async fn write_randomly<W: AsyncWrite + Unpin>(
     mut writer: W,
     data: &[u8],
@@ -22,7 +23,12 @@ async fn write_randomly<W: AsyncWrite + Unpin>(
     let mut rest = data;
     while !rest.is_empty() {
         let piece = (1 + rng.below(max_piece)).min(rest.len());
-        writer.write_all(&rest[..piece]).await?;
+        if seed.is_multiple_of(2) {
+            writer.write_all(&rest[..piece]).await?;
+        } else {
+            let mut slices = random_slices(&mut rng, &rest[..piece], 8);
+            write_all_vectored(&mut writer, &mut slices).await?;
+        }
         rest = &rest[piece..];
         if rng.below(8) == 0 {
             writer.flush().await?;
@@ -353,5 +359,70 @@ async fn read_through_large_frames() {
         };
         let (_, received) = tokio::join!(send, receive);
         assert!(received == data);
+    }
+}
+
+#[tokio::test]
+async fn small_reads_of_masked_data() {
+    for seed in 0..10 {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut client = WebSocketIO::new(
+            Chaos::new(client, seed, 20_000, true),
+            Role::Client,
+            Config::default(),
+        );
+        let mut server = WebSocketIO::new(
+            Chaos::new(server, seed + 100, 20_000, false),
+            Role::Server,
+            Config::default(),
+        );
+        let mut rng = Rng::new(seed);
+        let data = rng.bytes(1_000_000);
+
+        let send = async {
+            let mut rng = Rng::new(seed + 1);
+            let mut rest = &data[..];
+            while !rest.is_empty() {
+                let piece = (1 + rng.below(200_000)).min(rest.len());
+                let mut slices = random_slices(&mut rng, &rest[..piece], 16);
+                write_all_vectored(&mut client, &mut slices).await.unwrap();
+                rest = &rest[piece..];
+            }
+            client.close(None).await.unwrap();
+        };
+        let receive = async {
+            let mut received = Vec::new();
+            let mut buf = vec![0; 20_000];
+            loop {
+                // Mostly tiny reads, through every receiving interface.
+                let size = if rng.below(10) == 0 {
+                    1 + rng.below(20_000)
+                } else {
+                    1 + rng.below(16)
+                };
+                match rng.below(3) {
+                    0 => {
+                        let n = server.read(&mut buf[..size]).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        received.extend_from_slice(&buf[..n]);
+                    }
+                    1 => match server.recv(&mut buf[..size]).await.unwrap() {
+                        Recv::Binary { data, .. } => received.extend_from_slice(&buf[..data]),
+                        Recv::Close(_) => break,
+                        other => panic!("unexpected {other:?}"),
+                    },
+                    _ => match server.recv_bytes().await.unwrap() {
+                        Recv::Binary { data, .. } => received.extend_from_slice(&data),
+                        Recv::Close(_) => break,
+                        other => panic!("unexpected {other:?}"),
+                    },
+                }
+            }
+            received
+        };
+        let (_, received) = tokio::join!(send, receive);
+        assert!(received == data, "seed {seed}");
     }
 }

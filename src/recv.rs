@@ -76,6 +76,10 @@ enum FrameState {
 
 pub(crate) struct RecvState {
     buf: BytesMut,
+    /// How many bytes at the front of `buf` are payload of the current binary frame that has
+    /// already been unmasked. Masked payload is unmasked in bulk, as much as is buffered, so that
+    /// small reads are plain copies.
+    unmasked: usize,
     frame: FrameState,
     /// Kind of the fragmented message in progress, if any.
     message: Option<MessageKind>,
@@ -97,6 +101,7 @@ impl RecvState {
     pub(crate) fn new(buf: BytesMut) -> Self {
         Self {
             buf,
+            unmasked: 0,
             frame: FrameState::Header,
             message: None,
             text: BytesMut::new(),
@@ -110,6 +115,70 @@ impl RecvState {
 
     pub(crate) fn defer_error(&mut self, error: io::Error) {
         self.pending_error = Some(error);
+    }
+
+    /// Unmasks all buffered payload of the current binary frame, so that it can be taken as is.
+    #[inline]
+    fn unmask_buffered(&mut self, remaining: u64, mask: Option<[u8; 4]>, offset: usize) {
+        let Some(key) = mask else {
+            return;
+        };
+        let available = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(self.buf.len());
+        if self.unmasked < available {
+            mask::apply_mask(
+                &mut self.buf[self.unmasked..available],
+                key,
+                offset + self.unmasked,
+            );
+            self.unmasked = available;
+        }
+    }
+
+    /// Takes `n` bytes of the current binary frame's buffered payload.
+    #[inline]
+    fn take_binary<D: Dest>(
+        &mut self,
+        dest: &mut D,
+        n: usize,
+        remaining: u64,
+        mask: Option<[u8; 4]>,
+        offset: usize,
+    ) -> D::Chunk {
+        if mask.is_some() {
+            self.unmask_buffered(remaining, mask, offset);
+            self.unmasked -= n;
+        }
+        dest.take(&mut self.buf, n, None, 0)
+    }
+
+    /// Advances the current binary frame past `n` payload bytes.
+    #[inline]
+    fn advance_binary(&mut self, n: usize) -> bool {
+        let FrameState::Payload {
+            kind,
+            remaining,
+            mask,
+            offset,
+            fin,
+        } = self.frame
+        else {
+            unreachable!("called only inside of a payload");
+        };
+        let remaining = remaining - n as u64;
+        self.frame = if remaining == 0 {
+            FrameState::Header
+        } else {
+            FrameState::Payload {
+                kind,
+                remaining,
+                mask,
+                offset: (offset + n) % 4,
+                fin,
+            }
+        };
+        fin && remaining == 0
     }
 
     /// Frees the read buffer if it holds no data, so that idle connections do not pin memory.
@@ -255,6 +324,40 @@ impl Dest for BytesDest {
     }
 }
 
+impl<IO> WebSocketIO<IO> {
+    /// Fast path for reads in the middle of a binary frame whose payload is already buffered.
+    ///
+    /// Returns how many bytes it put into `buf`, and whether they end a message, or `None` if the
+    /// fast path does not apply.
+    #[inline]
+    pub(crate) fn read_buffered(&mut self, buf: &mut ReadBuf<'_>) -> Option<(usize, bool)> {
+        let FrameState::Payload {
+            kind: MessageKind::Binary,
+            remaining,
+            mask,
+            offset,
+            ..
+        } = self.recv.frame
+        else {
+            return None;
+        };
+        if self.recv.buf.is_empty()
+            || buf.remaining() == 0
+            || self.send.control_pending
+            || self.recv.failed
+            || self.recv.pending_error.is_some()
+        {
+            return None;
+        }
+        let n = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.remaining())
+            .min(self.recv.buf.len());
+        self.recv.take_binary(buf, n, remaining, mask, offset);
+        Some((n, self.recv.advance_binary(n)))
+    }
+}
+
 /// Result of a single step of the receive state machine: an event, or `None` to keep going.
 type Step<T> = Poll<io::Result<Option<Recv<T>>>>;
 
@@ -315,6 +418,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         dest: &mut D,
         buffered_only: bool,
     ) -> Step<D::Chunk> {
+        debug_assert_eq!(self.recv.unmasked, 0, "unmasked bytes left behind");
         let (header, header_len) = match frame::parse(&self.recv.buf) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => {
@@ -423,11 +527,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         buffered_only: bool,
     ) -> Step<D::Chunk> {
         let FrameState::Payload {
-            kind,
             remaining,
             mask,
             offset,
-            fin,
+            ..
         } = self.recv.frame
         else {
             unreachable!("called only inside of a payload");
@@ -445,7 +548,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
 
         let (n, chunk) = if !self.recv.buf.is_empty() {
             let n = limit.min(self.recv.buf.len());
-            (n, dest.take(&mut self.recv.buf, n, mask, offset))
+            (n, self.recv.take_binary(dest, n, remaining, mask, offset))
         } else if buffered_only {
             return Poll::Pending;
         } else if let Some(poll) = (limit >= self.config.read_buffer_size / 2)
@@ -467,21 +570,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
             return Poll::Ready(Ok(None));
         };
 
-        let remaining = remaining - n as u64;
-        self.recv.frame = if remaining == 0 {
-            FrameState::Header
-        } else {
-            FrameState::Payload {
-                kind,
-                remaining,
-                mask,
-                offset: (offset + n) % 4,
-                fin,
-            }
-        };
+        let end_of_message = self.recv.advance_binary(n);
         Poll::Ready(Ok(Some(Recv::Binary {
             data: chunk,
-            end_of_message: fin && remaining == 0,
+            end_of_message,
         })))
     }
 

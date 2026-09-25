@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "cpu_time"
 harness = false
+
+[[bench]]
+name = "usecase"
+harness = false

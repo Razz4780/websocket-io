@@ -1,7 +1,7 @@
 use std::{
     fmt,
     future::poll_fn,
-    io,
+    io::{self, IoSlice},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -119,6 +119,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<Recv>> {
+        if let Some((data, end_of_message)) = self.read_buffered(buf) {
+            return Poll::Ready(Ok(Recv::Binary {
+                data,
+                end_of_message,
+            }));
+        }
         self.poll_event(cx, buf, false)
     }
 
@@ -193,7 +199,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketIO<IO> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let start = buf.filled().len();
-        let mut buffered_only = false;
+        // Whatever comes after already delivered data may only be taken if it is buffered.
+        let mut buffered_only = this.read_buffered(buf).is_some();
 
         while buf.remaining() > 0 {
             let event = match this.poll_event(cx, buf, buffered_only) {
@@ -230,6 +237,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketIO<IO> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.get_mut().poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

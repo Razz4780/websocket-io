@@ -65,20 +65,32 @@ fn park_reader<IO: AsyncRead + Unpin>(reader: &mut IO) {
     assert!(Pin::new(reader).poll_read(&mut cx, &mut buf).is_pending());
 }
 
+async fn tcp_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b) = tokio::join!(
+        TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept()
+    );
+    (a.unwrap(), b.unwrap().0)
+}
+
 #[test]
 fn idle_connections_hold_no_buffers() {
     let _serial = SERIAL.lock().unwrap();
     runtime().block_on(async {
+        // Large writes use a scratch buffer shared by all connections of a thread. Create it
+        // before taking the baseline, it is not per-connection memory.
+        let (a, _b) = tcp_pair().await;
+        let mut warm_up = WebSocketIO::new(a, Role::Client, Config::default());
+        warm_up.write_all(&[0; 64 * 1024]).await.unwrap();
+        warm_up.flush().await.unwrap();
+
         for (sender_role, receiver_role) in
             [(Role::Client, Role::Server), (Role::Server, Role::Client)]
         {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (a, b) = tokio::join!(
-                TcpStream::connect(listener.local_addr().unwrap()),
-                listener.accept()
-            );
-            let mut sender = WebSocketIO::new(a.unwrap(), sender_role, Config::default());
-            let mut receiver = WebSocketIO::new(b.unwrap().0, receiver_role, Config::default());
+            let (a, b) = tcp_pair().await;
+            let mut sender = WebSocketIO::new(a, sender_role, Config::default());
+            let mut receiver = WebSocketIO::new(b, receiver_role, Config::default());
             let data = vec![42u8; 300 * 1024];
             let mut buf = vec![0u8; 64 * 1024];
             let mut pong = [0u8; 8];
@@ -107,8 +119,9 @@ fn idle_connections_hold_no_buffers() {
             park_reader(&mut sender);
             park_reader(&mut receiver);
             let retained = LIVE_BYTES.load(Ordering::Relaxed) - baseline;
-            assert_eq!(
-                retained, 0,
+            // Negative when the runtime freed some of its own memory in the meantime.
+            assert!(
+                retained <= 0,
                 "{sender_role:?} -> {receiver_role:?}: idle connection retains {retained} bytes"
             );
         }
