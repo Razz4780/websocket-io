@@ -18,7 +18,8 @@
 //! * Outgoing data is masked while being copied into the write buffer (clients), or written
 //!   straight from the caller's buffer with vectored writes (servers, large writes).
 //! * Masking uses vectorized kernels, with an AVX2 variant picked at runtime on x86-64.
-//! * No allocations in the steady state.
+//! * Buffers are held only while data is in flight: an idle connection holds no buffer memory,
+//!   and nothing is allocated per message.
 //!
 //! Extensions (e.g. permessage-deflate) are not supported, frames with RSV bits set fail the
 //! connection.

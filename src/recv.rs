@@ -23,9 +23,6 @@ use crate::{
     ws::WebSocketIO,
 };
 
-/// Payload reads at least this large bypass the read buffer, if it is empty.
-const READ_THROUGH_MIN: usize = 16 * 1024;
-
 /// Something received from the peer.
 ///
 /// `B` is the representation of binary data: the number of bytes appended to the caller's buffer
@@ -113,6 +110,14 @@ impl RecvState {
 
     pub(crate) fn defer_error(&mut self, error: io::Error) {
         self.pending_error = Some(error);
+    }
+
+    /// Frees the read buffer if it holds no data, so that idle connections do not pin memory.
+    /// Called when the IO has nothing to read.
+    fn release_buf(&mut self) {
+        if self.buf.is_empty() && self.buf.capacity() > 0 {
+            self.buf = BytesMut::new();
+        }
     }
 }
 
@@ -272,7 +277,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         }
         if self.send.control_pending
             && !buffered_only
-            && let Poll::Ready(Err(error)) = self.poll_drain(cx)
+            && let Poll::Ready(Err(error)) = self.poll_drain_idle(cx)
         {
             return self.fail(error);
         }
@@ -349,7 +354,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
                     if self.config.auto_pong && !self.send.close_sent {
                         self.send.pending_pong = Some(payload.clone());
                         self.send.control_pending = true;
-                        if let Poll::Ready(Err(error)) = self.poll_drain(cx) {
+                        if let Poll::Ready(Err(error)) = self.poll_drain_idle(cx) {
                             return self.fail(error);
                         }
                     }
@@ -443,11 +448,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
             (n, dest.take(&mut self.recv.buf, n, mask, offset))
         } else if buffered_only {
             return Poll::Pending;
-        } else if let Some(poll) = (limit >= READ_THROUGH_MIN)
+        } else if let Some(poll) = (limit >= self.config.read_buffer_size / 2)
             .then(|| dest.poll_read_through(&mut self.io, cx, limit, mask, offset))
             .flatten()
         {
-            let (n, chunk) = ready!(poll)?;
+            let Poll::Ready(result) = poll else {
+                self.recv.release_buf();
+                return Poll::Pending;
+            };
+            let (n, chunk) = result?;
             if n == 0 {
                 self.on_eof()?;
                 return Poll::Ready(Ok(None));
@@ -555,7 +564,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         if self.recv.text_valid != self.recv.text.len() {
             return self.fail_protocol(cx, ProtocolError::InvalidUtf8);
         }
-        let text = self.recv.text.split().freeze();
+        // Take the whole buffer, so that we do not keep its allocation alive after the caller drops
+        // the message.
+        let text = std::mem::take(&mut self.recv.text).freeze();
         self.recv.text_valid = 0;
         // SAFETY: validated above.
         let text = unsafe { Utf8Bytes::from_bytes_unchecked(text) };
@@ -572,7 +583,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
             buf.reserve(self.config.read_buffer_size);
         }
         let mut target = ReadBuf::uninit(buf.spare_capacity_mut());
-        ready!(Pin::new(&mut self.io).poll_read(cx, &mut target))?;
+        let Poll::Ready(result) = Pin::new(&mut self.io).poll_read(cx, &mut target) else {
+            self.recv.release_buf();
+            return Poll::Pending;
+        };
+        result?;
         let n = target.filled().len();
         // SAFETY: the reader initialized `n` bytes of spare capacity.
         unsafe { buf.set_len(buf.len() + n) };
@@ -609,7 +624,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
             return Poll::Ready(());
         }
         // The peer is gone either way, errors do not matter anymore.
-        if ready!(self.poll_drain(cx)).is_err() {
+        if ready!(self.poll_drain_idle(cx)).is_err() {
             self.send.buf.clear();
         }
         let _ = ready!(Pin::new(&mut self.io).poll_shutdown(cx));
@@ -632,7 +647,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         self.recv.failed = true;
         if !self.send.close_sent {
             self.send.queue_close(Some(error.close_code()), "");
-            let _ = self.poll_drain(cx);
+            let _ = self.poll_drain_idle(cx);
         }
         Poll::Ready(Err(error.into()))
     }

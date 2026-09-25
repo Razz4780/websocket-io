@@ -16,7 +16,7 @@ pub enum Role {
 /// use websocket_io::Config;
 ///
 /// let config = Config::default()
-///     .read_buffer_size(128 * 1024)
+///     .read_buffer_size(64 * 1024)
 ///     .max_frame_size(256 * 1024);
 /// ```
 #[derive(Clone, Debug)]
@@ -33,9 +33,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            read_buffer_size: 128 * 1024,
-            write_buffer_size: 128 * 1024,
-            max_frame_size: 256 * 1024,
+            read_buffer_size: 16 * 1024,
+            write_buffer_size: 16 * 1024,
+            max_frame_size: 64 * 1024,
             max_message_size: 16 * 1024 * 1024,
             auto_pong: true,
             defer_close_reply: false,
@@ -47,7 +47,12 @@ impl Default for Config {
 impl Config {
     /// Size of the internal read buffer, and the amount of data requested from the IO per read.
     ///
-    /// Defaults to 128 KiB. Values below 1 KiB are rounded up.
+    /// The buffer is allocated when data arrives and freed as soon as a read finds nothing more to
+    /// read, so idle connections hold no read buffer. Payload of large frames is read straight into
+    /// the caller's buffer instead, when this buffer is empty.
+    ///
+    /// Larger buffers mean fewer reads (and less CPU per byte) when data is queued up, at the cost
+    /// of memory per busy connection. Defaults to 16 KiB. Values below 1 KiB are rounded up.
     #[must_use]
     pub fn read_buffer_size(mut self, size: usize) -> Self {
         self.read_buffer_size = size.max(1024);
@@ -57,7 +62,12 @@ impl Config {
     /// Amount of outgoing data buffered before writes start to drain the buffer to the IO.
     ///
     /// Small writes are coalesced into this buffer and reach the IO on flush, or once the buffer
-    /// fills up. Defaults to 128 KiB.
+    /// fills up. Clients also mask their payload into it. The buffer is freed once a flush (or a
+    /// pong or Close reply sent by the receiving side) drains it, so idle connections hold no write
+    /// buffer.
+    ///
+    /// Larger buffers mean fewer writes (and less CPU per byte) for streams of small writes, at the
+    /// cost of memory per busy connection. Defaults to 16 KiB.
     #[must_use]
     pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.write_buffer_size = size;
@@ -67,9 +77,11 @@ impl Config {
     /// Maximum payload size of outgoing binary frames.
     ///
     /// A single write never produces a frame larger than this, it accepts only a prefix of the
-    /// data instead. Larger frames mean fewer headers and syscalls for large writes, but also a larger
-    /// worst-case copy when the IO accepts only a part of an unmasked frame written straight from the
-    /// caller's buffer. Defaults to 256 KiB. Values below 1 byte are rounded up.
+    /// data instead. Larger frames mean fewer headers and syscalls for large writes, and let the
+    /// peer read large payloads straight into its caller's buffer. They also raise memory use:
+    /// a client copies (and masks) a whole frame into its write buffer, and when the IO accepts
+    /// only a part of an unmasked frame written straight from the caller's buffer, the rest is
+    /// copied into the write buffer. Defaults to 64 KiB. Values below 1 byte are rounded up.
     #[must_use]
     pub fn max_frame_size(mut self, size: usize) -> Self {
         self.max_frame_size = size.max(1);

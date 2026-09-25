@@ -63,7 +63,13 @@ impl SendState {
             },
         );
 
-        self.buf.reserve(header_len + payload.len());
+        let needed = header_len + payload.len();
+        if self.buf.capacity() == 0 {
+            // The buffer was released while idle, allocate it in one go rather than growing it.
+            self.buf.reserve(needed.max(self.write_buffer_size));
+        } else {
+            self.buf.reserve(needed);
+        }
         self.buf.extend_from_slice(&header[..header_len]);
         match mask {
             Some(key) => {
@@ -97,6 +103,13 @@ impl SendState {
             && let Some(payload) = self.pending_pong.take()
         {
             self.push_frame(OpCode::Pong, &payload);
+        }
+    }
+
+    /// Frees the write buffer if it holds no data, so that idle connections do not pin memory.
+    fn release_buf(&mut self) {
+        if self.buf.is_empty() && self.buf.capacity() > 0 {
+            self.buf = BytesMut::new();
         }
     }
 
@@ -242,8 +255,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
     }
 
     /// Writes all buffered frames to the IO and flushes it.
+    ///
+    /// Frees the write buffer afterwards, so that an idle connection does not pin memory.
     pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_drain(cx))?;
+        ready!(self.poll_drain_idle(cx))?;
         Pin::new(&mut self.io).poll_flush(cx)
     }
 
@@ -269,7 +284,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
                 frame.map_or("", |frame| &frame.reason),
             );
         }
-        ready!(self.poll_drain(cx))?;
+        ready!(self.poll_drain_idle(cx))?;
         ready!(Pin::new(&mut self.io).poll_flush(cx))?;
         if self.recv.close_received.is_some() && !self.recv.shutdown_done {
             // The handshake is complete, a failure to shut down cannot lose any data.
@@ -279,8 +294,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
         Poll::Ready(Ok(()))
     }
 
-    /// Writes all buffered frames to the IO, without flushing it.
-    pub(crate) fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    /// Writes all buffered frames to the IO, without flushing it, and keeps the buffer for more
+    /// frames.
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             self.send.stage_pong();
             if self.send.buf.is_empty() {
@@ -293,6 +309,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WebSocketIO<IO> {
             self.send.buf.advance(written);
         }
         self.send.control_pending = false;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Like [`poll_drain`](Self::poll_drain), for when no more frames are expected soon: frees the
+    /// buffer once drained, so that an idle connection does not pin memory.
+    pub(crate) fn poll_drain_idle(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.poll_drain(cx))?;
+        self.send.release_buf();
         Poll::Ready(Ok(()))
     }
 }
